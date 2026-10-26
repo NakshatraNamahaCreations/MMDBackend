@@ -201,7 +201,7 @@ exports.createLead = async (req, res) => {
 // separately via getLeadById.
 const LEAD_LIST_FIELDS =
   "slNo name mobileNumber email service status assignedTo amount paymentStatus " +
-  "refundStatus refundAmount district state date time createdAt followUpDate orderId leadType source";
+  "refundStatus refundAmount district state date time createdAt updatedAt followUpDate orderId leadType source";
 
 // Run the lean list query and normalize each row (id + derived status bucket).
 const buildLeadList = async (query = {}) => {
@@ -236,6 +236,7 @@ const upsertLeadCache = (doc) => {
   const idx = leadListCache.data.findIndex((l) => l.id === row.id);
   if (idx !== -1) leadListCache.data[idx] = row;
   else leadListCache.data.unshift(row);
+  leadListCache.body = null;
 };
 // Exported so other controllers (e.g. the Paytm callback/refund) can keep the
 // cached list in sync — otherwise a payment marks the lead paid in the DB but
@@ -249,10 +250,14 @@ exports.upsertLeadCache = upsertLeadCache;
 // expensive query runs at most once per interval — no matter how many admins
 // are open. Up to ~25s staleness, which is fine for a CRM (and the panel does
 // optimistic updates for the user's own actions anyway).
-let leadListCache = { data: null, builtAt: 0 };
+// `body` is the ready-to-send JSON string of the full list (~13MB for 27k
+// leads). Stringifying that on every request cost ~1-2s, so it's built once and
+// reused until a write changes the list (body = null) or the IST day rolls over
+// (follow-up buckets depend on today's date).
+let leadListCache = { data: null, builtAt: 0, body: null, bodyDay: "" };
 const refreshLeadCache = async () => {
   try {
-    leadListCache = { data: await buildLeadList({}), builtAt: Date.now() };
+    leadListCache = { data: await buildLeadList({}), builtAt: Date.now(), body: null, bodyDay: "" };
   } catch (err) {
     console.error("lead cache refresh failed:", err.message);
   }
@@ -266,22 +271,37 @@ const refreshLeadCache = async () => {
 
 exports.listLeads = async (req, res) => {
   try {
-    const { status, search, assignedTo } = req.query;
+    const { status, search, assignedTo, since } = req.query;
+
+    // ?since=<ISO date> → only leads created/updated after that moment. The
+    // admin panel uses this to pick up new/changed leads without re-downloading
+    // the whole list. Indexed on updatedAt, so it's a tiny query.
+    if (since) {
+      const sinceDate = new Date(String(since));
+      if (Number.isNaN(sinceDate.getTime()))
+        return res.status(400).json({ success: false, message: "Invalid since" });
+      const out = await buildLeadList({ updatedAt: { $gte: sinceDate } });
+      return res.json({ success: true, count: out.length, data: out });
+    }
 
     // No filters → the panel's main load. Serve the cached full list instantly
     // (building it once if the cache is still cold).
     if (!status && !search && !assignedTo) {
       if (!leadListCache.data) await refreshLeadCache();
-      // Re-derive the follow-up bucket (overdue/today/followup) on every serve
-      // using TODAY's IST date. The cached row's stored bucket is frozen at the
-      // time it was written, so without this a lead scheduled for "tomorrow"
-      // would stay in Follow-up forever instead of rolling into Today/Overdue
-      // when its date arrives (there's no background cache rebuild anymore).
-      const data = (leadListCache.data || []).map((r) => {
-        const eff = effectiveStatus(r.status, r.followUpDate);
-        return eff === r.status ? r : { ...r, status: eff };
-      });
-      return res.json({ success: true, count: data.length, data });
+      const today = localToday();
+      if (!leadListCache.body || leadListCache.bodyDay !== today) {
+        // Re-derive the follow-up bucket (overdue/today/followup) using TODAY's
+        // IST date. The cached row's stored bucket is frozen at the time it was
+        // written, so without this a lead scheduled for "tomorrow" would stay
+        // in Follow-up forever instead of rolling into Today/Overdue.
+        const data = (leadListCache.data || []).map((r) => {
+          const eff = effectiveStatus(r.status, r.followUpDate);
+          return eff === r.status ? r : { ...r, status: eff };
+        });
+        leadListCache.body = JSON.stringify({ success: true, count: data.length, data });
+        leadListCache.bodyDay = today;
+      }
+      return res.type("application/json").send(leadListCache.body);
     }
 
     // Filtered queries are smaller and run directly (not cached).
@@ -417,6 +437,7 @@ exports.deleteLead = async (req, res) => {
     if (leadListCache.data) {
       const id = String(req.params.id);
       leadListCache.data = leadListCache.data.filter((l) => l.id !== id);
+      leadListCache.body = null;
     }
     return res.json({ success: true, message: "Lead deleted" });
   } catch (err) {

@@ -93,4 +93,9 @@ const leadSchema = new mongoose.Schema(
   }
 );
 
+// The admin panel's incremental sync asks for "leads changed since X", and the
+// full list is sorted newest-first — both need these to avoid a collection scan.
+leadSchema.index({ updatedAt: -1 });
+leadSchema.index({ createdAt: -1 });
+
 module.exports = mongoose.model("Lead", leadSchema);
