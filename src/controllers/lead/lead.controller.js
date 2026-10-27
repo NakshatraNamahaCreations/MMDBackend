@@ -201,7 +201,9 @@ exports.createLead = async (req, res) => {
 // separately via getLeadById.
 const LEAD_LIST_FIELDS =
   "slNo name mobileNumber email service status assignedTo amount paymentStatus " +
-  "refundStatus refundAmount district state date time createdAt updatedAt followUpDate orderId leadType source";
+  "refundStatus refundAmount district state date time createdAt updatedAt followUpDate orderId leadType source " +
+  // older "Tourist Visa" leads keep the visa country here (panel's country filter)
+  "applyingFor";
 
 // Run the lean list query and normalize each row (id + derived status bucket).
 const buildLeadList = async (query = {}) => {
