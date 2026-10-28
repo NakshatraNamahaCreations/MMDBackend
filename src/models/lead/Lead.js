@@ -97,5 +97,7 @@ const leadSchema = new mongoose.Schema(
 // full list is sorted newest-first — both need these to avoid a collection scan.
 leadSchema.index({ updatedAt: -1 });
 leadSchema.index({ createdAt: -1 });
+// Paged converted/dead tabs: filter by status, newest first.
+leadSchema.index({ status: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Lead", leadSchema);

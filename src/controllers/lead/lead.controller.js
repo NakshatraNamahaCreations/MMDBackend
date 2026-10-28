@@ -257,13 +257,28 @@ exports.upsertLeadCache = upsertLeadCache;
 // reused until a write changes the list (body = null) or the IST day rolls over
 // (follow-up buckets depend on today's date).
 let leadListCache = { data: null, builtAt: 0, body: null, bodyDay: "" };
-const refreshLeadCache = async () => {
-  try {
-    leadListCache = { data: await buildLeadList({}), builtAt: Date.now(), body: null, bodyDay: "" };
-  } catch (err) {
-    console.error("lead cache refresh failed:", err.message);
+// The cold build pulls every lead from the DB, which can take minutes on a slow
+// link. Share one in-flight build so concurrent/retried requests don't each
+// start another full download.
+let cacheBuild = null;
+const refreshLeadCache = () => {
+  if (!cacheBuild) {
+    cacheBuild = (async () => {
+      try {
+        leadListCache = { data: await buildLeadList({}), builtAt: Date.now(), body: null, bodyDay: "" };
+      } catch (err) {
+        console.error("lead cache refresh failed:", err.message);
+      } finally {
+        cacheBuild = null;
+      }
+    })();
   }
+  return cacheBuild;
 };
+
+// Closed leads (~99% of the collection). The panel's first load skips them so
+// the working lists (new/follow-up/in-process) appear in a second.
+const CLOSED_STATUSES = ["dead", "converted"];
 // NOTE: no background setInterval refresh. A periodic rebuild could finish a DB
 // query that started BEFORE a delete/update and overwrite the cache with stale
 // data — which made deletes/status-changes "sometimes" revert. Every write goes
@@ -273,7 +288,7 @@ const refreshLeadCache = async () => {
 
 exports.listLeads = async (req, res) => {
   try {
-    const { status, search, assignedTo, since } = req.query;
+    const { status, search, assignedTo, since, active } = req.query;
 
     // ?since=<ISO date> → only leads created/updated after that moment. The
     // admin panel uses this to pick up new/changed leads without re-downloading
@@ -283,6 +298,17 @@ exports.listLeads = async (req, res) => {
       if (Number.isNaN(sinceDate.getTime()))
         return res.status(400).json({ success: false, message: "Invalid since" });
       const out = await buildLeadList({ updatedAt: { $gte: sinceDate } });
+      return res.json({ success: true, count: out.length, data: out });
+    }
+
+    // ?active=1 → only open leads (not dead/converted). Served from the cache
+    // when it's warm, otherwise a small direct query (~250 rows).
+    if (active) {
+      const out = leadListCache.data
+        ? leadListCache.data
+            .filter((r) => !CLOSED_STATUSES.includes(r.status))
+            .map((r) => ({ ...r, status: effectiveStatus(r.status, r.followUpDate) }))
+        : await buildLeadList({ status: { $nin: CLOSED_STATUSES } });
       return res.json({ success: true, count: out.length, data: out });
     }
 
@@ -315,13 +341,165 @@ exports.listLeads = async (req, res) => {
         String(search).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
         "i"
       );
-      query.$or = [{ name: rx }, { mobileNumber: rx }, { orderId: rx }, { email: rx }];
+      query.$or = [{ name: rx }, { mobileNumber: rx }, { orderId: rx }, { email: rx }, { service: rx }];
     }
 
-    const out = await buildLeadList(query);
+    // ?limit=N caps the result (the panel's header search shows the top few).
+    const limit = Number(req.query.limit) || 0;
+    const out = limit
+      ? (await Lead.find(query).select(LEAD_LIST_FIELDS).sort({ createdAt: -1 }).limit(Math.min(limit, 100)).lean())
+          .map((o) => {
+            o.id = String(o._id);
+            delete o._id;
+            o.status = effectiveStatus(o.status, o.followUpDate);
+            return o;
+          })
+      : await buildLeadList(query);
     return res.json({ success: true, count: out.length, data: out });
   } catch (err) {
     console.error("listLeads error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+// Server-side paging for the big closed tabs (converted/dead, ~27k leads) so
+// the panel fetches one page at a time instead of the whole list. Mirrors the
+// LeadTable filters: search (name/mobile/district/service), payment, service
+// (incl. Tourist Visa + country), assignee, and column sort.
+// ?all=1 returns every match (CSV export).
+const escapeRx = (s) => String(s).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Same aliases as the panel's visaCountryOf().
+const VISA_COUNTRY_ALIASES = {
+  Dubai: ["united arab emirates", "united arab emirated", "uae"],
+  UK: ["united kingdom"],
+};
+const PAGE_SORT_KEYS = ["slNo", "date", "name", "mobileNumber", "district", "service", "amount", "createdAt"];
+
+exports.listLeadsPage = async (req, res) => {
+  try {
+    const q = req.query;
+    const status = String(q.status || "");
+    if (!CLOSED_STATUSES.includes(status)) {
+      // Open statuses are bucketed by follow-up date in JS, so they can't be
+      // filtered by the stored value — the panel loads those client-side.
+      return res.status(400).json({ success: false, message: "status must be converted or dead" });
+    }
+
+    const and = [{ status }];
+    if (q.assignedTo) and.push({ assignedTo: String(q.assignedTo) });
+    if (q.payment) and.push({ paymentStatus: String(q.payment) });
+    if (q.search && String(q.search).trim()) {
+      const rx = new RegExp(escapeRx(q.search), "i");
+      and.push({ $or: [{ name: rx }, { mobileNumber: rx }, { district: rx }, { service: rx }] });
+    }
+    if (q.service === "Tourist Visa") {
+      and.push({ service: /tourist visa\s*$/i });
+      if (q.country) {
+        const names = [String(q.country), ...(VISA_COUNTRY_ALIASES[q.country] || [])].map(escapeRx);
+        const country = names.join("|");
+        and.push({
+          $or: [
+            { service: new RegExp(`^\\s*(${country})\\s*tourist visa\\s*$`, "i") },
+            {
+              service: /^\s*tourist visa\s*$/i,
+              applyingFor: new RegExp(`^\\s*(${country})\\s*$`, "i"),
+            },
+          ],
+        });
+      }
+    } else if (q.service) {
+      and.push({ service: String(q.service) });
+    }
+    const query = { $and: and };
+
+    const sortKey = PAGE_SORT_KEYS.includes(q.sort) ? q.sort : "createdAt";
+    const dir = q.dir === "asc" ? 1 : -1;
+    const all = q.all === "1";
+    const limit = Math.min(Math.max(Number(q.limit) || 10, 1), 100);
+    const page = Math.max(Number(q.page) || 1, 1);
+
+    let find = Lead.find(query)
+      .select(LEAD_LIST_FIELDS)
+      .sort({ [sortKey]: dir, _id: dir })
+      .allowDiskUse(true);
+    if (!all) find = find.skip((page - 1) * limit).limit(limit);
+
+    const [rows, total, assignees] = await Promise.all([
+      find.lean(),
+      Lead.countDocuments(query),
+      Lead.distinct("assignedTo", { status }),
+    ]);
+    const data = rows.map((o) => {
+      o.id = String(o._id);
+      delete o._id;
+      return o;
+    });
+    return res.json({
+      success: true,
+      total,
+      page,
+      limit,
+      data,
+      assignees: assignees.filter(Boolean).sort(),
+    });
+  } catch (err) {
+    console.error("listLeadsPage error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+// Dashboard charts, computed in the DB so the panel never downloads every lead.
+// Days are IST calendar days (the panel's users are in India).
+const IST = "Asia/Kolkata";
+const istDayStart = (ymd) => new Date(`${ymd}T00:00:00+05:30`);
+const istDayEnd = (ymd) => new Date(`${ymd}T23:59:59.999+05:30`);
+const YMD_RX = /^\d{4}-\d{2}-\d{2}$/;
+
+// Leads created per IST day: [{ d: "YYYY-MM-DD", n }]. The panel buckets these
+// into the daily/monthly bars for whichever range is selected.
+exports.getDailyCounts = async (req, res) => {
+  try {
+    const match = { createdAt: { $type: "date" } };
+    if (req.query.assignedTo) match.assignedTo = String(req.query.assignedTo);
+    const rows = await Lead.aggregate([
+      { $match: match },
+      { $group: { _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: IST } }, n: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]);
+    return res.json({ success: true, data: rows.map((r) => ({ d: r._id, n: r.n })) });
+  } catch (err) {
+    console.error("getDailyCounts error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+// Leads and conversions per service, optionally within ?from=&to= (YYYY-MM-DD).
+exports.getServiceStats = async (req, res) => {
+  try {
+    const { from, to, assignedTo } = req.query;
+    const match = {};
+    if (assignedTo) match.assignedTo = String(assignedTo);
+    if ((from && YMD_RX.test(from)) || (to && YMD_RX.test(to))) {
+      match.createdAt = {};
+      if (from && YMD_RX.test(from)) match.createdAt.$gte = istDayStart(from);
+      if (to && YMD_RX.test(to)) match.createdAt.$lte = istDayEnd(to);
+    }
+    const rows = await Lead.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: "$service",
+          count: { $sum: 1 },
+          converted: { $sum: { $cond: [{ $eq: ["$status", "converted"] }, 1, 0] } },
+        },
+      },
+    ]);
+    return res.json({
+      success: true,
+      data: rows.map((r) => ({ name: r._id, count: r.count, converted: r.converted })),
+    });
+  } catch (err) {
+    console.error("getServiceStats error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
